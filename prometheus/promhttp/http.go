@@ -52,7 +52,21 @@ const (
 	acceptEncodingHeader  = "Accept-Encoding"
 )
 
-var bufPool sync.Pool
+var (
+	bufPool sync.Pool
+
+	scrapesCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "promhttp_metric_handler_requests_total",
+			Help: "Total number of scrapes by HTTP status code.",
+		},
+		[]string{"code"},
+	)
+	scrapesInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "promhttp_metric_handler_requests_in_flight",
+		Help: "Current number of scrapes being served.",
+	})
+)
 
 func getBuf() *bytes.Buffer {
 	buf := bufPool.Get()
@@ -76,6 +90,56 @@ func giveBuf(buf *bytes.Buffer) {
 // your desired HandlerOpts.
 func Handler() http.Handler {
 	return HandlerFor(prometheus.DefaultGatherer, HandlerOpts{})
+}
+
+// InstrumentedHandler works in the same way as Handler but the returned HTTP
+// handler is instrumented with two metrics, both registered with the
+// DefaultRegistry: "promhttp_metric_handler_requests_total", a counter vec for
+// scrapes labeled with the HTTP status code, and
+// "promhttp_metric_handler_requests_in_flight", a gauge for the number of
+// simultaneous scrapes. Note that the Prometheus server already generates a
+// "scrape_duration_seconds" gauge, recording the duration of each scrape. The
+// metrics provided by InstrumentedHandler are useful to see how many scrapes
+// hit the monitored target (which could be from different Prometheus servers or
+// other scrapers), and how often they overlap (which would result in more than
+// one scrape in flight at the same time). Note that the in-flight gauge will
+// contain the scrape by which it is exposed, while the scrape counter will only
+// get incremented after the scrape is complete (as only then the status code is
+// known).
+//
+// InstrumentedHandler is meant to cover most of the simple cases. If you need
+// anything special, like other metrics or non-default HandlerOpts, or you are
+// not using the DefaultRegisterer, you have to use the various
+// InstrumentHandler… middlewares provided by this package to do the
+// instrumentation explicitly.
+//
+// InstrumentHandler panics if the registration of the metrics fails. If metrics
+// of the same name are already registered, the already registered ones are
+// tried, again panicking upon failure.
+func InstrumentedHandler() http.Handler {
+	cnt := scrapesCounter
+	if err := prometheus.Register(cnt); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			cnt = are.ExistingCollector.(*prometheus.CounterVec)
+		} else {
+			panic(err)
+		}
+	}
+
+	gge := scrapesInFlight
+	if err := prometheus.Register(gge); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			gge = are.ExistingCollector.(prometheus.Gauge)
+		} else {
+			panic(err)
+		}
+	}
+
+	return InstrumentHandlerCounter(cnt,
+		InstrumentHandlerInFlight(gge,
+			HandlerFor(prometheus.DefaultGatherer, HandlerOpts{}),
+		),
+	)
 }
 
 // HandlerFor returns an http.Handler for the provided Gatherer. The behavior
